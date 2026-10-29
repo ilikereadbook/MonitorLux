@@ -1,0 +1,17 @@
+# build output
+dist/
+bin/
+obj/
+*.log
+*.pdb
+
+# WorkBuddy / editor session data
+.workbuddy/
+.vs/
+.vscode/
+*.user
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
