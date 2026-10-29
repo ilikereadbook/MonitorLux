@@ -198,6 +198,266 @@ namespace MonitorLux
     }
 
     // ------------------------------------------------------------------
+    // Display topology: internal only / external only / extend / clone
+    // Same thing Win+P does, exposed as one hotkey.
+    // ------------------------------------------------------------------
+    public static class DisplayTopology
+    {
+        public enum Mode { Unknown = 0, Internal = 1, External = 2, Extend = 3, Clone = 4 }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LUID { public uint LowPart; public int HighPart; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RATIONAL { public uint Numerator; public uint Denominator; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PATH_SOURCE
+        {
+            public LUID adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PATH_TARGET
+        {
+            public LUID adapterId;
+            public uint id;
+            public uint modeInfoIdx;
+            public uint outputTechnology;
+            public uint rotation;
+            public uint scaling;
+            public RATIONAL refreshRate;
+            public uint scanLineOrdering;
+            public int targetAvailable;
+            public uint statusFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PATH_INFO
+        {
+            public PATH_SOURCE sourceInfo;
+            public PATH_TARGET targetInfo;
+            public uint flags;
+        }
+
+        // only ever used as an opaque buffer, so a padded blob is enough
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MODE_INFO
+        {
+            public uint infoType;
+            public uint id;
+            public LUID adapterId;
+            public ulong p0, p1, p2, p3, p4, p5;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPath, out uint numMode);
+
+        [DllImport("user32.dll")]
+        private static extern int QueryDisplayConfig(uint flags, ref uint numPath,
+            [Out] PATH_INFO[] paths, ref uint numMode, [Out] MODE_INFO[] modes, IntPtr topologyId);
+
+        [DllImport("user32.dll")]
+        private static extern int SetDisplayConfig(uint numPath, IntPtr paths, uint numMode, IntPtr modes, uint flags);
+
+        private const uint QDC_ALL_PATHS         = 0x00000001;
+        private const uint SDC_TOPOLOGY_INTERNAL = 0x00000001;
+        private const uint SDC_TOPOLOGY_CLONE    = 0x00000002;
+        private const uint SDC_TOPOLOGY_EXTEND   = 0x00000004;
+        private const uint SDC_TOPOLOGY_EXTERNAL = 0x00000008;
+        private const uint SDC_APPLY             = 0x00000080;
+        private const uint PATH_ACTIVE           = 0x00000001;
+        private const uint TECH_INTERNAL         = 0x80000000;
+
+        public static int LastError = 0;
+
+        // sizes must be source=24, target=48, path=80 (x64) - they are checked in --dispinfo
+        public static string Sizes()
+        {
+            return "source=" + Marshal.SizeOf(typeof(PATH_SOURCE)) +
+                   " target=" + Marshal.SizeOf(typeof(PATH_TARGET)) +
+                   " path=" + Marshal.SizeOf(typeof(PATH_INFO)) +
+                   " mode=" + Marshal.SizeOf(typeof(MODE_INFO));
+        }
+
+        private static PATH_INFO[] Query()
+        {
+            try
+            {
+                uint np = 0, nm = 0;
+                if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, out np, out nm) != 0 || np == 0) return null;
+                np += 8;
+                nm += 8;
+                PATH_INFO[] paths = new PATH_INFO[np];
+                MODE_INFO[] modes = new MODE_INFO[nm];
+                if (QueryDisplayConfig(QDC_ALL_PATHS, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) return null;
+                if (np < (uint)paths.Length) Array.Resize(ref paths, (int)np);
+                return paths;
+            }
+            catch { return null; }
+        }
+
+        private static bool IsInternal(PATH_INFO p) { return (p.targetInfo.outputTechnology & TECH_INTERNAL) != 0; }
+
+        public static bool HasInternalPanel
+        {
+            get
+            {
+                PATH_INFO[] p = Query();
+                if (p == null) return false;
+                for (int i = 0; i < p.Length; i++) if (IsInternal(p[i])) return true;
+                return false;
+            }
+        }
+
+        public static bool HasExternalPanel
+        {
+            get
+            {
+                PATH_INFO[] p = Query();
+                if (p == null) return false;
+                for (int i = 0; i < p.Length; i++)
+                    if (!IsInternal(p[i]) && p[i].targetInfo.targetAvailable != 0) return true;
+                return false;
+            }
+        }
+
+        public static Mode Current
+        {
+            get
+            {
+                PATH_INFO[] p = Query();
+                if (p == null) return Mode.Unknown;
+                int ni = 0, ne = 0;
+                // a source is identified by adapter + id: the iGPU and the dGPU each
+                // number their sources from 0, so the id alone is not unique
+                uint iLow = 0, eLow = 0, iId = 0, eId = 0;
+                int iHigh = 0, eHigh = 0;
+                for (int i = 0; i < p.Length; i++)
+                {
+                    if ((p[i].flags & PATH_ACTIVE) == 0) continue;
+                    if (IsInternal(p[i]))
+                    {
+                        ni++;
+                        iLow = p[i].sourceInfo.adapterId.LowPart;
+                        iHigh = p[i].sourceInfo.adapterId.HighPart;
+                        iId = p[i].sourceInfo.id;
+                    }
+                    else
+                    {
+                        ne++;
+                        eLow = p[i].sourceInfo.adapterId.LowPart;
+                        eHigh = p[i].sourceInfo.adapterId.HighPart;
+                        eId = p[i].sourceInfo.id;
+                    }
+                }
+                if (ni > 0 && ne == 0) return Mode.Internal;
+                if (ne > 0 && ni == 0) return Mode.External;
+                if (ni > 0 && ne > 0)
+                {
+                    bool sameSource = iLow == eLow && iHigh == eHigh && iId == eId;
+                    return sameSource ? Mode.Clone : Mode.Extend;
+                }
+                return Mode.Unknown;
+            }
+        }
+
+        // raw path dump, used by --dispinfo to verify the marshalling
+        public static string[] Dump()
+        {
+            PATH_INFO[] p = Query();
+            if (p == null) return new string[] { "QueryDisplayConfig failed" };
+            List<string> l = new List<string>();
+            l.Add("paths=" + p.Length);
+            for (int i = 0; i < p.Length; i++)
+            {
+                PATH_INFO x = p[i];
+                l.Add(string.Format(
+                    "#{0} active={1} internal={2} tech=0x{3:X8} avail={4} srcAdapter={5:X8}:{6:X8} srcId={7} tgtId={8}",
+                    i,
+                    (x.flags & PATH_ACTIVE) != 0 ? 1 : 0,
+                    IsInternal(x) ? 1 : 0,
+                    x.targetInfo.outputTechnology,
+                    x.targetInfo.targetAvailable,
+                    x.sourceInfo.adapterId.HighPart,
+                    x.sourceInfo.adapterId.LowPart,
+                    x.sourceInfo.id,
+                    x.targetInfo.id));
+            }
+            return l.ToArray();
+        }
+
+        public static bool Apply(Mode m)
+        {
+            uint topo;
+            switch (m)
+            {
+                case Mode.Internal: topo = SDC_TOPOLOGY_INTERNAL; break;
+                case Mode.External: topo = SDC_TOPOLOGY_EXTERNAL; break;
+                case Mode.Extend:   topo = SDC_TOPOLOGY_EXTEND; break;
+                case Mode.Clone:    topo = SDC_TOPOLOGY_CLONE; break;
+                default: return false;
+            }
+            int rc;
+            try { rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, topo | SDC_APPLY); }
+            catch { rc = -1; }
+            LastError = rc;
+            return rc == 0;
+        }
+
+        public static string Name(Mode m)
+        {
+            switch (m)
+            {
+                case Mode.Internal: return "\u4EC5\u5185\u7F6E\u5C4F\u5E55";   // 仅内置屏幕
+                case Mode.External: return "\u4EC5\u5916\u63A5\u5C4F\u5E55";   // 仅外接屏幕
+                case Mode.Extend:   return "\u6269\u5C55\u663E\u793A";         // 扩展显示
+                case Mode.Clone:    return "\u590D\u5236\u5C4F\u5E55";         // 复制屏幕
+                default: return "\u672A\u77E5";                               // 未知
+            }
+        }
+
+        // glyph id understood by Osd: 1 laptop, 2 monitor, 3 extend, 4 clone, 5 warning
+        public static int Glyph(Mode m)
+        {
+            switch (m)
+            {
+                case Mode.Internal: return 1;
+                case Mode.External: return 2;
+                case Mode.Extend: return 3;
+                case Mode.Clone: return 4;
+                default: return 5;
+            }
+        }
+    }
+
+    // one call does it: switch, rescan monitors, show feedback
+    public static class DisplayActions
+    {
+        public static void Go(DisplayTopology.Mode target)
+        {
+            bool ok = DisplayTopology.Apply(target);
+            if (ok)
+            {
+                // the topology is live as soon as the call returns, but DDC handles
+                // belong to the old configuration - give the OS a beat, then rescan
+                try { System.Threading.Thread.Sleep(260); } catch { }
+                DisplayTopology.Mode now = DisplayTopology.Current;
+                if (now != DisplayTopology.Mode.Unknown) target = now;
+                try { Brightness.Reload(); } catch { }
+                Osd.ShowText(DisplayTopology.Name(target), DisplayTopology.Glyph(target));
+            }
+            else
+            {
+                Osd.ShowText("\u5207\u6362\u5931\u8D25 (" + DisplayTopology.LastError + ")", 5);   // 切换失败
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // On-screen display: layered capsule, click-through, auto fade out
     // ------------------------------------------------------------------
     public class Osd : Form
@@ -228,6 +488,7 @@ namespace MonitorLux
         private const int FADE_OUT = 230;
 
         private static Osd live;
+        public static Rectangle LastBounds = Rectangle.Empty;
 
         private int value = 50;
         private float scale = 1f;
@@ -236,6 +497,8 @@ namespace MonitorLux
         private System.Windows.Forms.Timer timer;
         private Bitmap buffer;
         private Bitmap backdrop;
+        private string label = null;   // null = brightness bar mode
+        private int glyph = 0;
 
         private Osd()
         {
@@ -272,37 +535,74 @@ namespace MonitorLux
         {
             try
             {
-                if (live == null || live.IsDisposed)
+                if (live != null && !live.IsDisposed)
                 {
-                    live = new Osd();
-                    live.Start(v);
+                    if (live.label == null)
+                    {
+                        live.value = v;
+                        live.startTick = Now() - FADE_IN;
+                        live.Tick();
+                        return;
+                    }
+                    live.Close2();
                 }
-                else
-                {
-                    live.value = v;
-                    live.startTick = Now() - FADE_IN;
-                    live.Tick();
-                }
+                live = new Osd();
+                live.Start(v, null, 0);
             }
             catch { }
         }
 
-        private void Start(int v)
+        // text variant, used when the display topology changes
+        public static void ShowText(string text, int glyph)
+        {
+            try
+            {
+                if (live != null && !live.IsDisposed) live.Close2();
+                live = new Osd();
+                live.Start(0, text, glyph);
+            }
+            catch { }
+        }
+
+        private Font LabelFont()
+        {
+            return new Font("Microsoft YaHei UI", 16f * scale, FontStyle.Regular, GraphicsUnit.Pixel);
+        }
+
+        private void Start(int v, string text, int glyph)
         {
             value = v;
+            label = text;
+            this.glyph = glyph;
+
             Screen scr = null;
             try { scr = Screen.FromPoint(Cursor.Position); } catch { }
             if (scr == null) scr = Screen.PrimaryScreen;
             scale = ScaleOf(scr);
 
-            width = (int)Math.Round(224 * scale);
             height = (int)Math.Round(64 * scale);
+            if (label == null)
+            {
+                width = (int)Math.Round(224 * scale);
+            }
+            else
+            {
+                int textW;
+                using (Bitmap tmp = new Bitmap(1, 1))
+                using (Graphics mg = Graphics.FromImage(tmp))
+                using (Font f = LabelFont())
+                    textW = (int)Math.Ceiling(mg.MeasureString(label, f).Width) + (int)Math.Round(2 * scale);
+                width = (int)Math.Round(20 * scale) + (int)Math.Round(22 * scale) +
+                        (int)Math.Round(9 * scale) + textW + (int)Math.Round(20 * scale);
+            }
+
             Rectangle wa = scr.WorkingArea;
             baseX = wa.Right - width - (int)Math.Round(22 * scale);
             baseY = wa.Bottom - height - (int)Math.Round(22 * scale);
 
             buffer = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             CaptureBackdrop();
+            LastBounds = new Rectangle(baseX, baseY, width, height);
             Show();
             startTick = Now();
             timer = new System.Windows.Forms.Timer();
@@ -410,52 +710,135 @@ namespace MonitorLux
                         g.DrawPath(pen, p);
                 }
 
-                int cx = (int)Math.Round(29 * scale);
-                int cy = height / 2;
-                float cr = 5.4f * scale;
-                using (SolidBrush b = new SolidBrush(fg))
-                    g.FillEllipse(b, cx - cr, cy - cr, cr * 2, cr * 2);
-                using (Pen pen = new Pen(fg, Math.Max(1.1f, 1.5f * scale)))
+                if (label == null)
                 {
-                    pen.StartCap = LineCap.Round;
-                    pen.EndCap = LineCap.Round;
-                    for (int i = 0; i < 8; i++)
+                    int cx = (int)Math.Round(29 * scale);
+                    int cy = height / 2;
+                    float cr = 5.4f * scale;
+                    using (SolidBrush b = new SolidBrush(fg))
+                        g.FillEllipse(b, cx - cr, cy - cr, cr * 2, cr * 2);
+                    using (Pen pen = new Pen(fg, Math.Max(1.1f, 1.5f * scale)))
                     {
-                        double a = Math.PI / 4.0 * i;
-                        double r1 = 8.2 * scale, r2 = 11.4 * scale;
-                        g.DrawLine(pen,
-                            (float)(cx + Math.Cos(a) * r1), (float)(cy + Math.Sin(a) * r1),
-                            (float)(cx + Math.Cos(a) * r2), (float)(cy + Math.Sin(a) * r2));
+                        pen.StartCap = LineCap.Round;
+                        pen.EndCap = LineCap.Round;
+                        for (int i = 0; i < 8; i++)
+                        {
+                            double a = Math.PI / 4.0 * i;
+                            double r1 = 8.2 * scale, r2 = 11.4 * scale;
+                            g.DrawLine(pen,
+                                (float)(cx + Math.Cos(a) * r1), (float)(cy + Math.Sin(a) * r1),
+                                (float)(cx + Math.Cos(a) * r2), (float)(cy + Math.Sin(a) * r2));
+                        }
+                    }
+
+                    int tx = (int)Math.Round(52 * scale);
+                    int tw = (int)Math.Round(108 * scale);
+                    int th = Math.Max(3, (int)Math.Round(5 * scale));
+                    int ty = cy - th / 2;
+                    using (GraphicsPath tp = Ui.Rounded(new Rectangle(tx, ty, tw, th), th / 2))
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(52, 255, 255, 255)))
+                        g.FillPath(b, tp);
+                    int fw = (int)Math.Round(tw * (value / 100.0));
+                    if (fw > 0)
+                    {
+                        if (fw < th) fw = th;
+                        using (GraphicsPath fp = Ui.Rounded(new Rectangle(tx, ty, fw, th), th / 2))
+                        using (SolidBrush b = new SolidBrush(fg))
+                            g.FillPath(b, fp);
+                    }
+
+                    string s = value + "%";
+                    using (Font f = new Font("Segoe UI", 17f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(246, 255, 255, 255)))
+                    {
+                        SizeF sz = g.MeasureString(s, f);
+                        float x = width - (float)(16 * scale) - sz.Width;
+                        float y = (height - sz.Height) / 2f;
+                        g.DrawString(s, f, b, x, y);
                     }
                 }
-
-                int tx = (int)Math.Round(52 * scale);
-                int tw = (int)Math.Round(108 * scale);
-                int th = Math.Max(3, (int)Math.Round(5 * scale));
-                int ty = cy - th / 2;
-                using (GraphicsPath tp = Ui.Rounded(new Rectangle(tx, ty, tw, th), th / 2))
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(52, 255, 255, 255)))
-                    g.FillPath(b, tp);
-                int fw = (int)Math.Round(tw * (value / 100.0));
-                if (fw > 0)
+                else
                 {
-                    if (fw < th) fw = th;
-                    using (GraphicsPath fp = Ui.Rounded(new Rectangle(tx, ty, fw, th), th / 2))
-                    using (SolidBrush b = new SolidBrush(fg))
-                        g.FillPath(b, fp);
-                }
+                    int gs = (int)Math.Round(22 * scale);
+                    Rectangle area = new Rectangle((int)Math.Round(20 * scale), (height - gs) / 2, gs, gs);
+                    DrawDisplayGlyph(g, area, glyph, fg);
 
-                string s = value + "%";
-                using (Font f = new Font("Segoe UI", 17f * scale, FontStyle.Regular, GraphicsUnit.Pixel))
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(246, 255, 255, 255)))
-                {
-                    SizeF sz = g.MeasureString(s, f);
-                    float x = width - (float)(16 * scale) - sz.Width;
-                    float y = (height - sz.Height) / 2f;
-                    g.DrawString(s, f, b, x, y);
+                    using (Font f = LabelFont())
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(246, 255, 255, 255)))
+                    {
+                        SizeF sz = g.MeasureString(label, f);
+                        float x = area.Right + (float)(9 * scale);
+                        float y = (height - sz.Height) / 2f;
+                        g.DrawString(label, f, b, x, y);
+                    }
                 }
             }
             Push(alpha, offsetY);
+        }
+
+        private static GraphicsPath RoundRectF(float x, float y, float w, float h, float r)
+        {
+            GraphicsPath p = new GraphicsPath();
+            float d = Math.Min(r * 2f, Math.Min(w, h));
+            if (d <= 0.5f) { p.AddRectangle(new RectangleF(x, y, w, h)); return p; }
+            p.AddArc(x, y, d, d, 180, 90);
+            p.AddArc(x + w - d, y, d, d, 270, 90);
+            p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+            p.AddArc(x, y + h - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        private void FillRound(Graphics g, Brush b, float x, float y, float w, float h, float r)
+        {
+            using (GraphicsPath p = RoundRectF(x, y, w, h, r)) g.FillPath(b, p);
+        }
+
+        // 1 laptop panel, 2 external monitor, 3 extend, 4 duplicate, 5 warning
+        private void DrawDisplayGlyph(Graphics g, Rectangle area, int kind, Color c)
+        {
+            float x = area.X, y = area.Y, w = area.Width, h = area.Height;
+            if (kind == 5)
+            {
+                using (Pen p = new Pen(c, Math.Max(1.6f, 1.9f * scale)))
+                {
+                    p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+                    RectangleF cir = new RectangleF(x + w * 0.06f, y + h * 0.06f, w * 0.88f, h * 0.88f);
+                    g.DrawEllipse(p, cir);
+                    g.DrawLine(p, x + w * 0.5f, y + h * 0.28f, x + w * 0.5f, y + h * 0.55f);
+                }
+                using (SolidBrush b = new SolidBrush(c))
+                    g.FillEllipse(b, x + w * 0.46f, y + h * 0.62f, w * 0.09f, h * 0.09f);
+                return;
+            }
+
+            using (SolidBrush b = new SolidBrush(c))
+            {
+                if (kind == 1)
+                {
+                    FillRound(g, b, x + w * 0.16f, y + h * 0.11f, w * 0.68f, h * 0.50f, w * 0.10f);
+                    FillRound(g, b, x + w * 0.04f, y + h * 0.63f, w * 0.92f, h * 0.17f, h * 0.085f);
+                }
+                else if (kind == 2)
+                {
+                    FillRound(g, b, x + w * 0.07f, y + h * 0.08f, w * 0.86f, h * 0.55f, w * 0.10f);
+                    g.FillRectangle(b, x + w * 0.45f, y + h * 0.63f, w * 0.10f, h * 0.19f);
+                    FillRound(g, b, x + w * 0.26f, y + h * 0.82f, w * 0.48f, h * 0.10f, h * 0.05f);
+                }
+                else if (kind == 3)
+                {
+                    FillRound(g, b, x + w * 0.02f, y + h * 0.16f, w * 0.42f, h * 0.42f, w * 0.09f);
+                    FillRound(g, b, x + w * 0.56f, y + h * 0.16f, w * 0.42f, h * 0.42f, w * 0.09f);
+                    FillRound(g, b, x + w * 0.11f, y + h * 0.64f, w * 0.24f, h * 0.09f, h * 0.045f);
+                    FillRound(g, b, x + w * 0.65f, y + h * 0.64f, w * 0.24f, h * 0.09f, h * 0.045f);
+                }
+                else
+                {
+                    using (Pen p = new Pen(Color.FromArgb(150, c), Math.Max(1.3f, 1.7f * scale)))
+                        g.DrawPath(p, RoundRectF(x + w * 0.32f, y + h * 0.10f, w * 0.62f, h * 0.50f, w * 0.10f));
+                    FillRound(g, b, x + w * 0.06f, y + h * 0.32f, w * 0.62f, h * 0.50f, w * 0.10f);
+                }
+            }
         }
 
         private void Push(double alpha, int offsetY)
@@ -759,9 +1142,13 @@ namespace MonitorLux
         private const int WM_HOTKEY = 0x0312;
         private const uint MOD_ALT = 1;
         private const uint MOD_CONTROL = 2;
+        private const uint MOD_SHIFT = 4;
         private const uint MOD_NOREPEAT = 0x4000;
         private const int VK_UP = 0x26;
         private const int VK_DOWN = 0x28;
+        private const int VK_1 = 0x31;
+        private const int VK_2 = 0x32;
+        private const int VK_3 = 0x33;
 
         [DllImport("user32.dll")]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
@@ -771,6 +1158,10 @@ namespace MonitorLux
         public const int STEP = 5;
         public static bool UpOk = false;
         public static bool DownOk = false;
+        public static bool InternalOk = false;
+        public static bool ExternalOk = false;
+        public static bool ExtendOk = false;
+        public static string BrightnessKeys = "";
 
         public HotkeyWindow()
         {
@@ -788,8 +1179,27 @@ namespace MonitorLux
         {
             base.OnHandleCreated(e);
             uint mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+
+            // Ctrl+Alt+arrows is already taken on a lot of machines (Intel graphics
+            // rotation, IMEs, GPU overlays). Try it first, then fall back to +Shift.
             UpOk = RegisterHotKey(Handle, 10, mods, VK_UP);
             DownOk = RegisterHotKey(Handle, 11, mods, VK_DOWN);
+            if (UpOk && DownOk)
+            {
+                BrightnessKeys = "Ctrl+Alt+\u2191\u2193";
+            }
+            else
+            {
+                if (UpOk) { UnregisterHotKey(Handle, 10); UpOk = false; }
+                if (DownOk) { UnregisterHotKey(Handle, 11); DownOk = false; }
+                UpOk = RegisterHotKey(Handle, 10, mods | MOD_SHIFT, VK_UP);
+                DownOk = RegisterHotKey(Handle, 11, mods | MOD_SHIFT, VK_DOWN);
+                if (UpOk && DownOk) BrightnessKeys = "Ctrl+Shift+Alt+\u2191\u2193";
+            }
+
+            InternalOk = RegisterHotKey(Handle, 12, mods, VK_1);
+            ExternalOk = RegisterHotKey(Handle, 13, mods, VK_2);
+            ExtendOk = RegisterHotKey(Handle, 14, mods, VK_3);
         }
 
         protected override void WndProc(ref Message m)
@@ -799,13 +1209,24 @@ namespace MonitorLux
                 int id = m.WParam.ToInt32();
                 if (id == 10) Brightness.Adjust(STEP);
                 else if (id == 11) Brightness.Adjust(-STEP);
+                else if (id == 12) DisplayActions.Go(DisplayTopology.Mode.Internal);
+                else if (id == 13) DisplayActions.Go(DisplayTopology.Mode.External);
+                else if (id == 14) DisplayActions.Go(DisplayTopology.Mode.Extend);
             }
             base.WndProc(ref m);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            try { UnregisterHotKey(Handle, 10); UnregisterHotKey(Handle, 11); } catch { }
+            try
+            {
+                UnregisterHotKey(Handle, 10);
+                UnregisterHotKey(Handle, 11);
+                UnregisterHotKey(Handle, 12);
+                UnregisterHotKey(Handle, 13);
+                UnregisterHotKey(Handle, 14);
+            }
+            catch { }
             base.OnFormClosing(e);
         }
     }
@@ -1787,6 +2208,7 @@ namespace MonitorLux
         private HotkeyWindow hotkeys;
         private long lastClose = 0;
         private bool balloonShown = false;
+        public static ContextMenuStrip Menu;
 
         public TrayContext()
         {
@@ -1814,11 +2236,53 @@ namespace MonitorLux
             };
 
             ContextMenuStrip menu = new ContextMenuStrip();
+            Menu = menu;
 
-            ToolStripMenuItem hint = new ToolStripMenuItem("Ctrl+Alt+\u6EDA\u8F6E / Ctrl+Alt+\u2191\u2193 \u8C03\u4EAE\u5EA6");
+            ToolStripMenuItem hint = new ToolStripMenuItem();
             hint.Enabled = false;
             menu.Items.Add(hint);
             menu.Items.Add(new ToolStripSeparator());
+
+            // ---- display topology: internal only / external only / extend ----
+            ToolStripMenuItem onlyInternal = new ToolStripMenuItem(
+                "\u4EC5\u5185\u7F6E\u5C4F\u5E55", null,   // 仅内置屏幕
+                delegate { DisplayActions.Go(DisplayTopology.Mode.Internal); });
+            ToolStripMenuItem onlyExternal = new ToolStripMenuItem(
+                "\u4EC5\u5916\u63A5\u5C4F\u5E55", null,   // 仅外接屏幕
+                delegate { DisplayActions.Go(DisplayTopology.Mode.External); });
+            ToolStripMenuItem extendItem = new ToolStripMenuItem(
+                "\u6269\u5C55\u663E\u793A", null,         // 扩展显示
+                delegate { DisplayActions.Go(DisplayTopology.Mode.Extend); });
+            menu.Items.Add(onlyInternal);
+            menu.Items.Add(onlyExternal);
+            menu.Items.Add(extendItem);
+            menu.Items.Add(new ToolStripSeparator());
+
+            // reflect the live topology every time the menu opens
+            menu.Opening += delegate
+            {
+                string wheel = "Ctrl+Alt+\u6EDA\u8F6E";
+                hint.Text = (HotkeyWindow.BrightnessKeys.Length > 0
+                                 ? wheel + " / " + HotkeyWindow.BrightnessKeys
+                                 : wheel) + "  \u8C03\u4EAE\u5EA6";
+
+                DisplayTopology.Mode now = DisplayTopology.Current;
+                bool hasInt = DisplayTopology.HasInternalPanel;
+                bool hasExt = DisplayTopology.HasExternalPanel;
+                onlyInternal.Enabled = hasInt;
+                onlyExternal.Enabled = hasExt;
+                extendItem.Enabled = hasInt && hasExt;
+                onlyInternal.Checked = now == DisplayTopology.Mode.Internal;
+                onlyExternal.Checked = now == DisplayTopology.Mode.External;
+                extendItem.Checked = now == DisplayTopology.Mode.Extend;
+
+                onlyInternal.ShortcutKeyDisplayString = HotkeyWindow.InternalOk ? "Ctrl+Alt+1" : "";
+                onlyExternal.ShortcutKeyDisplayString = HotkeyWindow.ExternalOk ? "Ctrl+Alt+2" : "";
+                extendItem.ShortcutKeyDisplayString = HotkeyWindow.ExtendOk ? "Ctrl+Alt+3" : "";
+                if (!hasExt) onlyExternal.Text = "\u4EC5\u5916\u63A5\u5C4F\u5E55 (\u672A\u68C0\u6D4B\u5230)";
+                else onlyExternal.Text = "\u4EC5\u5916\u63A5\u5C4F\u5E55";
+            };
+
             menu.Items.Add("\u6253\u5F00\u8C03\u8282\u9762\u677F", null, delegate { ShowPopup(true); });   // 打开调节面板
             menu.Items.Add("\u5237\u65B0\u663E\u793A\u5668", null, delegate { ShowPopup(true); });         // 刷新显示器
             menu.Items.Add(new ToolStripSeparator());
@@ -1922,10 +2386,26 @@ namespace MonitorLux
             if (args.Length > 0 && args[0] == "--preview") { Preview(false); return; }
             if (args.Length > 0 && args[0] == "--preview-dark") { Theme.ForceDark = true; Preview(true); return; }
             if (args.Length > 0 && args[0] == "--traytest") { TrayTest(); return; }
-            if (args.Length > 0 && args[0] == "--osdtest") { OsdTest(); return; }
+            if (args.Length > 0 && args[0] == "--osdtest") { OsdTest("20"); return; }
+            if (args.Length > 1 && args[0] == "--osdtext") { OsdTest(args[1]); return; }
+            if (args.Length > 0 && args[0] == "--menutest") { MenuTest(); return; }
             if (args.Length > 0 && args[0] == "--uninstall") { Uninstaller.Run(); return; }
             if (args.Length > 0 && args[0] == "--autostart-on") { Autostart.Apply(true); return; }
             if (args.Length > 0 && args[0] == "--autostart-off") { Autostart.Apply(false); return; }
+            if (args.Length > 0 && args[0] == "--dispinfo") { DispInfo(); return; }
+
+            // --display internal|external|extend|clone
+            if (args.Length >= 2 && args[0] == "--display")
+            {
+                DisplayTopology.Mode m = DisplayTopology.Mode.Unknown;
+                string k = args[1].ToLowerInvariant();
+                if (k == "internal" || k == "1") m = DisplayTopology.Mode.Internal;
+                else if (k == "external" || k == "2") m = DisplayTopology.Mode.External;
+                else if (k == "extend" || k == "3") m = DisplayTopology.Mode.Extend;
+                else if (k == "clone" || k == "4") m = DisplayTopology.Mode.Clone;
+                if (m != DisplayTopology.Mode.Unknown) DisplayTopology.Apply(m);
+                return;
+            }
 
             // CLI: --set 20 / --step -5   (runs without the tray app being resident)
             if (args.Length >= 2 && (args[0] == "--set" || args[0] == "--step"))
@@ -1949,15 +2429,75 @@ namespace MonitorLux
             Application.Run(new TrayContext());
         }
 
+        // opens the tray menu, screenshots it, exits - used to verify the menu visuals
+        private static void MenuTest()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Theme.Update();
+            string dir = Path.GetDirectoryName(Application.ExecutablePath);
+            try
+            {
+                TrayContext ctx = new TrayContext();
+                ContextMenuStrip m = TrayContext.Menu;
+                Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+                m.Show(new Point(wa.Right - 400, wa.Bottom - 480));
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(300);
+                Application.DoEvents();
+                Rectangle r = m.Bounds;
+                List<string> dbg = new List<string>();
+                dbg.Add("menuBounds=" + r);
+                dbg.Add("topology=" + DisplayTopology.Current);
+                foreach (ToolStripItem it in m.Items)
+                {
+                    ToolStripMenuItem mi = it as ToolStripMenuItem;
+                    if (mi != null)
+                        dbg.Add("[T] " + mi.Text + " checked=" + mi.Checked + " enabled=" + mi.Enabled +
+                                " sc=" + mi.ShortcutKeyDisplayString);
+                    else dbg.Add("[ ] " + it.GetType().Name);
+                }
+                File.WriteAllLines(Path.Combine(dir, "_menu.txt"), dbg.ToArray());
+                r.Inflate(12, 12);
+                r.Intersect(Screen.PrimaryScreen.Bounds);
+                if (r.Width > 0 && r.Height > 0)
+                {
+                    using (Bitmap bmp = new Bitmap(r.Width, r.Height))
+                    {
+                        using (Graphics g = Graphics.FromImage(bmp))
+                            g.CopyFromScreen(r.X, r.Y, 0, 0, r.Size);
+                        bmp.Save(Path.Combine(dir, "_menu.png"), ImageFormat.Png);
+                    }
+                }
+                m.Close();
+                Application.Exit();
+            }
+            catch (Exception ex)
+            {
+                File.WriteAllText(Path.Combine(dir, "_menu_err.txt"), ex.ToString());
+            }
+        }
+
         // renders the OSD once and screenshots it, used to verify visuals
-        private static void OsdTest()
+        // arg "20" = brightness mode, anything else = text mode ("internal|external|extend|clone|<text>")
+        private static void OsdTest(string arg)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Theme.Update();
             try { Brightness.Reload(); } catch { }
 
-            Osd.ShowValue(20);
+            int n;
+            if (int.TryParse(arg, out n)) Osd.ShowValue(n);
+            else
+            {
+                DisplayTopology.Mode m = DisplayTopology.Mode.External;
+                if (arg == "internal") m = DisplayTopology.Mode.Internal;
+                else if (arg == "extend") m = DisplayTopology.Mode.Extend;
+                else if (arg == "clone") m = DisplayTopology.Mode.Clone;
+                else if (arg == "warn") m = DisplayTopology.Mode.Unknown;
+                Osd.ShowText(DisplayTopology.Name(m), DisplayTopology.Glyph(m));
+            }
 
             System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
             t.Interval = 700;
@@ -1968,8 +2508,11 @@ namespace MonitorLux
                 {
                     Screen scr = Screen.FromPoint(Cursor.Position);
                     Rectangle wa = scr.WorkingArea;
-                    int cw = 340, ch = 150;
-                    Rectangle r = new Rectangle(wa.Right - cw, wa.Bottom - ch, cw, ch);
+                    Rectangle r = Osd.LastBounds;
+                    if (r.Width <= 0) r = new Rectangle(wa.Right - 320, wa.Bottom - 120, 320, 120);
+                    r.Inflate(10, 10);
+                    r.Intersect(scr.Bounds);
+                    int cw = r.Width, ch = r.Height;
                     using (Bitmap bmp = new Bitmap(cw, ch))
                     {
                         using (Graphics g = Graphics.FromImage(bmp))
@@ -2091,7 +2634,12 @@ namespace MonitorLux
                 lines.Add("Brightness.HasControl=" + Brightness.HasControl + " value=" + Brightness.Value);
                 lines.Add("WinHook.Installed=" + WinHook.Installed);
                 lines.Add("TrayHit.Bound=" + TrayHit.Bound);
-                lines.Add("HotkeyUp=" + HotkeyWindow.UpOk + " HotkeyDown=" + HotkeyWindow.DownOk);
+                lines.Add("HotkeyUp=" + HotkeyWindow.UpOk + " HotkeyDown=" + HotkeyWindow.DownOk +
+                          " keys=[" + HotkeyWindow.BrightnessKeys + "]");
+                lines.Add("Hotkey1/2/3=" + HotkeyWindow.InternalOk + "/" + HotkeyWindow.ExternalOk +
+                          "/" + HotkeyWindow.ExtendOk);
+                lines.Add("Topology=" + DisplayTopology.Current + " hasInternal=" +
+                          DisplayTopology.HasInternalPanel + " hasExternal=" + DisplayTopology.HasExternalPanel);
                 lines.Add("AutostartEnabled=" + Autostart.IsEnabled());
                 System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
                 t.Interval = 1500;
@@ -2118,6 +2666,29 @@ namespace MonitorLux
             lines.Add("DpiScale=" + Ui.S);
             string dir = Path.GetDirectoryName(Application.ExecutablePath);
             File.WriteAllLines(Path.Combine(dir, "_selftest.txt"), lines.ToArray());
+        }
+
+        // topology diagnostic, used to verify the P/Invoke layouts
+        private static void DispInfo()
+        {
+            List<string> lines = new List<string>();
+            try
+            {
+                lines.Add("PathInfoSize=" + DisplayTopology.Sizes());
+                lines.Add("HasInternalPanel=" + DisplayTopology.HasInternalPanel);
+                lines.Add("HasExternalPanel=" + DisplayTopology.HasExternalPanel);
+                DisplayTopology.Mode now = DisplayTopology.Current;
+                lines.Add("Current=" + now + " (" + DisplayTopology.Name(now) + ")");
+                lines.Add("Screens=" + Screen.AllScreens.Length);
+                foreach (Screen s in Screen.AllScreens)
+                    lines.Add("  " + s.DeviceName + " bounds=" + s.Bounds + " primary=" + s.Primary);
+                lines.Add("Hotkey 1/2/3 = " + HotkeyWindow.InternalOk + "/" +
+                          HotkeyWindow.ExternalOk + "/" + HotkeyWindow.ExtendOk);
+                foreach (string s in DisplayTopology.Dump()) lines.Add(s);
+            }
+            catch (Exception ex) { lines.Add("EXCEPTION: " + ex); }
+            File.WriteAllLines(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath),
+                "_dispinfo.txt"), lines.ToArray());
         }
     }
 }

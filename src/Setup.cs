@@ -19,7 +19,7 @@ namespace MonitorLuxSetup
         private static string L(string zh, string en) { return Zh ? zh : en; }
 
         public static void ForceEnglish() { Zh = false; }
-        private const string Version = "1.0.0";
+        private const string Version = "1.1.0";
         private const string PayloadName = "MonitorLux.exe";
 
         private float k = 1f;
@@ -172,9 +172,15 @@ namespace MonitorLuxSetup
 
             using (Font f2 = new Font("Microsoft YaHei UI", 9F))
             using (SolidBrush b2 = new SolidBrush(Color.FromArgb(114, 114, 122)))
-                g.DrawString(L("Ctrl+Alt+\u6EDA\u8F6E\u3001\u6258\u76D8\u6EDA\u8F6E\u3001Ctrl+Alt+\u2191\u2193 \u968F\u65F6\u8C03\u4EAE\u5EA6",
-                        "Ctrl+Alt+wheel \u00B7 tray wheel \u00B7 Ctrl+Alt+\u2191\u2193   adjust anytime"),
+                g.DrawString(L("Ctrl+Alt+\u6EDA\u8F6E \u00B7 \u6258\u76D8\u6EDA\u8F6E \u968F\u65F6\u8C03\u4EAE\u5EA6",
+                        "Ctrl+Alt+wheel \u00B7 tray wheel \u00B7   adjust anytime"),
                     f2, b2, P(93), P(58));
+
+            using (Font f5 = new Font("Microsoft YaHei UI", 8.5F))
+            using (SolidBrush b5 = new SolidBrush(Color.FromArgb(136, 136, 144)))
+                g.DrawString(L("Ctrl+Alt+1 \u4EC5\u5185\u7F6E\u5C4F \u00B7 Ctrl+Alt+2 \u4EC5\u5916\u63A5\u5C4F \u00B7 Ctrl+Alt+3 \u6269\u5C55",
+                        "Ctrl+Alt+1 internal \u00B7 Ctrl+Alt+2 external \u00B7 Ctrl+Alt+3 extend"),
+                    f5, b5, P(93), P(77));
 
             using (Pen p = new Pen(Color.FromArgb(238, 238, 242), Math.Max(1f, k)))
                 g.DrawLine(p, P(30), P(98), P(440), P(98));
@@ -195,6 +201,14 @@ namespace MonitorLuxSetup
                 if (n.EndsWith("app.ico", StringComparison.OrdinalIgnoreCase))
                     return asm.GetManifestResourceStream(n);
             return null;
+        }
+
+        // unattended install, used by --silent and by scripted deployment
+        public void SilentInstall()
+        {
+            chkAuto.Checked = true;
+            chkMenu.Checked = true;
+            DoInstall();
         }
 
         private void SetStatus(string s)
@@ -347,6 +361,16 @@ namespace MonitorLuxSetup
             if (args.Length > 0 && args[0] == "--verify") { Verify(); return; }
             if (args.Length > 0 && args[0] == "--preview") { Preview(); return; }
             if (args.Length > 0 && args[0] == "--preview-en") { SetupForm.ForceEnglish(); Preview(); return; }
+
+            // unattended install: same steps as the UI, no window
+            if (args.Length > 0 && args[0] == "--silent")
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                SetupForm s = new SetupForm();
+                s.SilentInstall();
+                return;
+            }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);

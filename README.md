@@ -1,6 +1,6 @@
 # MonitorLux
 
-**Control your external monitor's brightness with the mouse wheel — no window, no admin rights, no tray clutter.**
+**Brightness and display-mode switching for Windows, driven by the mouse wheel and a few hotkeys — no window, no admin rights, no tray clutter.**
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2011%20%7C%2010-0067C0?logo=windows11&logoColor=white)](#compatibility)
 [![.NET](https://img.shields.io/badge/.NET%20Framework-4.x-512BD4?logo=dotnet&logoColor=white)](#build-from-source)
@@ -8,7 +8,7 @@
 
 English · [简体中文](README.zh-CN.md)
 
-![Brightness OSD](docs/osd.png)
+![Brightness OSD](docs/osd.png) ![Display mode OSD](docs/osd-display.png)
 
 ---
 
@@ -34,11 +34,12 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 | | |
 |---|---|
 | 🖱️ **Mouse wheel anywhere** | `Ctrl + Alt + wheel` adjusts brightness from any window, no clicking, nothing to open |
-| ⌨️ **Hotkeys** | `Ctrl + Alt + ↑ / ↓`, ±5% per press |
-| 🖼️ **Frosted-glass OSD** | A small capsule fades in at the corner with the current percentage, then disappears. Click-through, never steals focus |
+| ⌨️ **Hotkeys** | `Ctrl + Alt + ↑ / ↓`, ±5% per press. Falls back to `Ctrl + Shift + Alt + ↑ / ↓` if something else owns the combination |
+| 🖥️ **Display modes** | `Ctrl + Alt + 1` laptop panel only · `Ctrl + Alt + 2` external monitor only · `Ctrl + Alt + 3` extend. What `Win+P` does, in one keystroke |
+| 🖼️ **Frosted-glass OSD** | A small capsule fades in at the corner with the current percentage or the new mode, then disappears. Click-through, never steals focus |
 | 🪟 **Tray-native** | Lives in the notification area. No main window at all — the panel only appears if you ask for it |
 | 🌗 **Light / dark** | Follows your Windows theme automatically, checked each time it opens |
-| 🔓 **No admin rights** | DDC/CI writes work as a normal user, so no UAC prompt on every launch |
+| 🔓 **No admin rights** | DDC/CI writes and display switching both work as a normal user, so no UAC prompt on every launch |
 | 🚀 **Single instance** | Launch it twice and the second copy exits quietly |
 | 📦 **Green binary** | One `.exe`, no runtime install, no registry mess beyond an optional autostart entry |
 
@@ -60,10 +61,15 @@ That's the whole setup. You never need to "open" it again.
 |---|---|
 | `Ctrl + Alt` + **mouse wheel** | Adjust brightness from anywhere |
 | `Ctrl + Alt + ↑` / `↓` | ±5% |
+| `Ctrl + Alt + 1` | Only the internal (laptop) panel |
+| `Ctrl + Alt + 2` | Only the external monitor |
+| `Ctrl + Alt + 3` | Extend — both displays, side by side |
 | **Wheel** over the tray icon | Adjust without a modifier key |
 | **Left-click** tray icon | Open the full panel (all monitors, sliders) |
 | **Esc** / click elsewhere | Dismiss the panel |
-| **Right-click** tray icon | Refresh monitors · Start with Windows · Exit |
+| **Right-click** tray icon | Display modes · Refresh monitors · Start with Windows · Exit |
+
+The display-mode items only light up for hardware that is actually present — plug the external monitor in and *Only external monitor* becomes available; unplug it and the item greys out.
 
 ![Full panel, light and dark](docs/panel-light.png)
 
@@ -72,17 +78,24 @@ That's the whole setup. You never need to "open" it again.
 Useful for scripts, shortcuts, or Stream Deck buttons. These work without the tray app running.
 
 ```bat
-MonitorLux.exe --set 20          :: set to 20%
-MonitorLux.exe --step -5         :: decrease by 5%
-MonitorLux.exe --step +10        :: increase by 10%
-MonitorLux.exe --selftest        :: enumerate monitors and print current values
-MonitorLux.exe --autostart-on    :: enable autostart
-MonitorLux.exe --uninstall       :: remove autostart + registry entries
+MonitorLux.exe --set 20            :: set to 20%
+MonitorLux.exe --step -5           :: decrease by 5%
+MonitorLux.exe --step +10          :: increase by 10%
+MonitorLux.exe --display internal  :: laptop panel only
+MonitorLux.exe --display external  :: external monitor only
+MonitorLux.exe --display extend    :: both displays
+MonitorLux.exe --display clone     :: mirrored
+MonitorLux.exe --dispinfo          :: dump the display topology and raw paths
+MonitorLux.exe --selftest          :: enumerate monitors and print current values
+MonitorLux.exe --autostart-on      :: enable autostart
+MonitorLux.exe --uninstall         :: remove autostart + registry entries
 ```
 
 ## How it works
 
 - **Brightness** goes through `dxva2.dll` (`GetNumberOfPhysicalMonitorsFromHMONITOR` → `SetMonitorBrightness`). The DDC/CI *capability* query is deliberately skipped — see [above](#why-this-exists). Writes are debounced, because consecutive DDC/CI commands too close together get dropped by the monitor, and failed writes are retried once.
+- **Display modes** call `SetDisplayConfig` with the same topology flags Windows itself uses for `Win+P` (`SDC_TOPOLOGY_INTERNAL` / `_EXTERNAL` / `_EXTEND`). No path or mode arrays are built by hand, so the OS is free to pick valid modes for whatever hardware answers. The whole switch is one API call — no external tools, no admin rights.
+- **Internal vs external** is read back from `QueryDisplayConfig`: an embedded panel is the target whose `outputTechnology` has the high bit set (`0x80000000`). A source is keyed by *adapter + id*, not id alone — on hybrid laptops the iGPU and the dGPU each number their sources from zero, so comparing ids alone makes extend look like clone.
 - **The OSD** grabs the desktop behind itself, downsamples it, blurs it, and paints the result inside a rounded capsule with a tint, a top highlight, and a 1px inner border. (WinForms cannot use DWM acrylic once you paint translucent content — the blur layer gets destroyed — so the glass is rendered by hand.)
 - **Mouse wheel** is captured with a low-level hook (`WH_MOUSE_LL`); the tray icon's screen rectangle is cached so the hook never calls into the shell per event.
 - **DPI aware** via a `PerMonitorV2` manifest, so text and icons render at native pixels on scaled displays instead of being bitmap-stretched.
@@ -136,7 +149,13 @@ Yes — something has to listen for the wheel and hotkeys. But it starts silentl
 Both hold global hooks and both write to the same VCP code. Pick one.
 
 **Nothing happens when I press the hotkeys.**
-Check that the tray icon is present. If it is, another app may already own `Ctrl+Alt+↑/↓` — those registrations are global and first-come-first-served.
+`Ctrl+Alt+↑/↓` is owned by something else on a lot of machines — Intel graphics rotation, IMEs, GPU overlays. MonitorLux finds out at startup and re-registers the brightness pair as `Ctrl+Shift+Alt+↑/↓`. The tray menu always shows the combination that actually got registered, so check there rather than assuming.
+
+**Does switching display modes need admin rights?**
+No. `SetDisplayConfig` is a per-user operation, exactly like `Win+P`.
+
+**The screen goes black for a second when I switch.**
+That is the OS renegotiating the link with the monitor. Same thing happens with `Win+P`; it is not this app.
 
 ## License
 

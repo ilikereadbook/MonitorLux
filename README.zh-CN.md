@@ -1,6 +1,6 @@
 # MonitorLux
 
-**用鼠标滚轮调外接显示器亮度 —— 不弹窗口，不要管理员权限，不占地方。**
+**用鼠标滚轮调外接显示器亮度，用一个热键切"只用这块屏 / 只用那块屏" —— 不弹窗口，不要管理员权限，不占地方。**
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2011%20%7C%2010-0067C0?logo=windows11&logoColor=white)](#兼容性)
 [![.NET](https://img.shields.io/badge/.NET%20Framework-4.x-512BD4?logo=dotnet&logoColor=white)](#从源码构建)
@@ -8,7 +8,7 @@
 
 [English](README.md) · 简体中文
 
-![亮度 OSD](docs/osd.png)
+![亮度 OSD](docs/osd.png) ![显示模式 OSD](docs/osd-display.png)
 
 ---
 
@@ -34,11 +34,12 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 | | |
 |---|---|
 | 🖱️ **任意位置滚滚轮** | `Ctrl + Alt + 滚轮`，在哪个窗口都能调，不用点开任何东西 |
-| ⌨️ **全局热键** | `Ctrl + Alt + ↑ / ↓`，每次 ±5% |
-| 🖼️ **磨砂玻璃 OSD** | 右下角淡入一个小胶囊显示百分比，随后自动消失。点击穿透，不抢焦点 |
+| ⌨️ **全局热键** | `Ctrl + Alt + ↑ / ↓`，每次 ±5%。若被别的程序占用，自动改用 `Ctrl + Shift + Alt + ↑ / ↓` |
+| 🖥️ **一键切显示模式** | `Ctrl + Alt + 1` 仅内置屏 · `Ctrl + Alt + 2` 仅外接屏 · `Ctrl + Alt + 3` 扩展。就是 `Win+P` 那件事，但按一次就够 |
+| 🖼️ **磨砂玻璃 OSD** | 右下角淡入一个小胶囊，显示当前百分比或刚切到的模式，随后自动消失。点击穿透，不抢焦点 |
 | 🪟 **纯托盘** | 没有主窗口。需要看详情时才弹面板 |
 | 🌗 **深浅色跟随系统** | 每次弹出时实时读取系统主题，切主题不用重启 |
-| 🔓 **不需要管理员权限** | 普通用户即可写 DDC/CI，所以每次开机不会弹 UAC |
+| 🔓 **不需要管理员权限** | 写 DDC/CI 和切显示模式都是普通用户权限，所以每次开机不会弹 UAC |
 | 🚀 **单实例** | 重复启动会自动静默退出 |
 | 📦 **绿色单文件** | 一个 exe，不装运行时；除了可选的自启项不碰注册表 |
 
@@ -60,10 +61,15 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 |---|---|
 | `Ctrl + Alt` + **滚轮** | 在任意位置调节亮度 |
 | `Ctrl + Alt + ↑` / `↓` | 每次 ±5% |
+| `Ctrl + Alt + 1` | 只用内置屏（笔记本屏幕） |
+| `Ctrl + Alt + 2` | 只用外接屏 |
+| `Ctrl + Alt + 3` | 扩展：两块屏并排 |
 | 在**托盘图标**上滚轮 | 不用按修饰键也能调 |
 | **左键**点托盘图标 | 打开完整面板（所有显示器 + 滑块） |
 | **Esc** / 点面板外 | 收起面板 |
-| **右键**托盘图标 | 刷新显示器 · 开机自启 · 退出 |
+| **右键**托盘图标 | 显示模式 · 刷新显示器 · 开机自启 · 退出 |
+
+显示模式三项只在硬件真的存在时才可点：插上外接屏，「仅外接屏」才会亮；拔掉就置灰。
 
 ![完整面板：浅色 / 深色](docs/panel-light.png)
 
@@ -74,17 +80,24 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 适合写脚本、做快捷方式或绑到 Stream Deck 上。**不依赖托盘进程，单独跑也行。**
 
 ```bat
-MonitorLux.exe --set 20          :: 设为 20%
-MonitorLux.exe --step -5         :: 减 5%
-MonitorLux.exe --step +10        :: 加 10%
-MonitorLux.exe --selftest        :: 列出显示器并打印当前亮度
-MonitorLux.exe --autostart-on    :: 开启开机自启
-MonitorLux.exe --uninstall       :: 清除自启与注册表项
+MonitorLux.exe --set 20            :: 设为 20%
+MonitorLux.exe --step -5           :: 减 5%
+MonitorLux.exe --step +10          :: 加 10%
+MonitorLux.exe --display internal  :: 仅内置屏
+MonitorLux.exe --display external  :: 仅外接屏
+MonitorLux.exe --display extend    :: 扩展
+MonitorLux.exe --display clone     :: 复制
+MonitorLux.exe --dispinfo          :: 打印当前拓扑与原始 path 数据
+MonitorLux.exe --selftest          :: 列出显示器并打印当前亮度
+MonitorLux.exe --autostart-on      :: 开启开机自启
+MonitorLux.exe --uninstall         :: 清除自启与注册表项
 ```
 
 ## 实现要点
 
 - **亮度**走 `dxva2.dll`（`GetNumberOfPhysicalMonitorsFromHMONITOR` → `SetMonitorBrightness`），刻意**跳过** DDC/CI 的能力查询。写入做了防抖 —— 连续两条 DDC 命令间隔太近会被显示器丢弃；写入失败会自动重试一次。
+- **显示模式**调 `SetDisplayConfig`，用的是 Windows 自己 `Win+P` 那套拓扑标志（`SDC_TOPOLOGY_INTERNAL` / `_EXTERNAL` / `_EXTEND`）。不手工拼 path 和 mode 数组，具体分辨率交给系统按硬件实际情况决定。整个切换就是一次 API 调用，不依赖任何外部工具，也不需要提权。
+- **区分内置屏和外接屏**靠回读 `QueryDisplayConfig`：内嵌面板的 `outputTechnology` 带最高位（`0x80000000`）。另一个坑是 **source 必须用 adapter + id 联合标识** —— 混合显卡笔记本上核显和独显各自从 0 开始编号，只比 id 会把"扩展"误判成"复制"。
 - **OSD**：先把自身位置背后的桌面抓下来，降采样 → 模糊 → 升采样，再叠一层染色、顶部高光和 1px 内描边画进圆角胶囊。WinForms 一旦给内容画半透明，DWM 的丙烯酸模糊层就会被吃掉，所以玻璃是手工渲染的。
 - **滚轮**用底层钩子（`WH_MOUSE_LL`）捕获；托盘图标的屏幕矩形做了缓存，钩子不会为每个滚轮事件都去问 shell。
 - **DPI 感知**：清单声明 `PerMonitorV2`，在缩放屏上按原生像素渲染，而不是被系统位图拉伸。
@@ -120,7 +133,7 @@ docs/      截图
 - **Windows 11**（在 build 26200 上实测）和 **Windows 10**
 - 显示器需在 OSD 菜单里**开启 DDC/CI**，多数默认开启
 - **DP / HDMI / DVI / VGA** 都行，前提是线材传了 DDC 通道
-- **笔记本内置屏**一般没有 DDC/CI，请用系统自带的亮度滑块
+- **笔记本内置屏**一般没有 DDC/CI，调亮度请用系统自带的滑块；切显示模式则内外屏都可以
 - 不是每台显示器都提供亮度 VCP 码 —— `--selftest` 报 `Ok=False` 说明这块屏确实不接受 DDC 写入
 
 **已知限制**
@@ -138,7 +151,13 @@ docs/      截图
 两者都挂全局钩子、都写同一个 VCP 码，二选一。
 
 **按热键没反应？**
-先确认托盘里有图标。如果有，可能是别的程序已经占了 `Ctrl+Alt+↑/↓` —— 这两个热键是全局的，先到先得。
+`Ctrl+Alt+↑/↓` 在很多机器上已经被别人占了（Intel 显卡旋转、输入法、显卡驱动的浮层）。程序在启动时会检测，注册失败就自动改用 `Ctrl+Shift+Alt+↑/↓`。**以托盘右键菜单里显示的组合为准**，别想当然。
+
+**切显示模式要提权吗？**
+不要。`SetDisplayConfig` 是每用户操作，和 `Win+P` 一样。
+
+**切的时候屏幕会黑一下？**
+那是系统在跟显示器重新协商链路，`Win+P` 也会这样，不是本程序的问题。
 
 ## 许可
 
