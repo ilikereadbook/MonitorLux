@@ -338,6 +338,42 @@ namespace MonitorLuxSetup
             catch { }
         }
 
+        // Older builds shipped as ScreenBrightness.exe. Desktop shortcuts the user
+        // already has keep pointing there, so repoint them at the current install.
+        public static void FixShortcuts()
+        {
+            string exe = Path.Combine(InstallDir, PayloadName);
+            if (!File.Exists(exe)) return;
+            Type t = Type.GetTypeFromProgID("WScript.Shell");
+            if (t == null) return;
+            object shell = Activator.CreateInstance(t);
+
+            System.Collections.Generic.List<string> dirs = new System.Collections.Generic.List<string>();
+            dirs.Add(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+            dirs.Add(Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory));
+
+            foreach (string dir in dirs)
+            {
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
+                foreach (string f in Directory.GetFiles(dir, "*.lnk"))
+                {
+                    try
+                    {
+                        object sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { f });
+                        Type st = sc.GetType();
+                        string target = (string)st.InvokeMember("TargetPath", BindingFlags.GetProperty, null, sc, null);
+                        if (string.IsNullOrEmpty(target)) continue;
+                        if (target.IndexOf("ScreenBrightness.exe", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        st.InvokeMember("TargetPath", BindingFlags.SetProperty, null, sc, new object[] { exe });
+                        st.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, sc, new object[] { InstallDir });
+                        st.InvokeMember("IconLocation", BindingFlags.SetProperty, null, sc, new object[] { exe + ",0" });
+                        st.InvokeMember("Save", BindingFlags.InvokeMethod, null, sc, new object[] { });
+                    }
+                    catch { }
+                }
+            }
+        }
+
         private static void MakeShortcut(string lnk, string target, string workDir, string icon, string desc)
         {
             Type t = Type.GetTypeFromProgID("WScript.Shell");
@@ -371,6 +407,9 @@ namespace MonitorLuxSetup
                 s.SilentInstall();
                 return;
             }
+
+            // repoint desktop shortcuts left over from the pre-rename install
+            if (args.Length > 0 && args[0] == "--fix-shortcut") { SetupForm.FixShortcuts(); return; }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
