@@ -46,7 +46,7 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 
 **方式一：安装包（推荐）**
 
-到 [Releases](../../releases) 下载 `Setup.exe` 运行。会装到 `%LOCALAPPDATA%\Programs\MonitorLux`，建开始菜单和桌面快捷方式，开启开机自启并直接启动。卸载走 **设置 → 应用**。
+到 [Releases](../../releases) 下载 `MonitorLux-Setup.exe` 运行。会装到 `%LOCALAPPDATA%\Programs\MonitorLux`，建开始菜单和桌面快捷方式，开启开机自启并直接启动。卸载走 **设置 → 应用**。
 
 **方式二：绿色版**
 
@@ -101,7 +101,7 @@ cd MonitorLux
 # 主程序 -> dist\MonitorLux.exe
 powershell -ExecutionPolicy Bypass -File .\build\build.ps1
 
-# 单文件安装器 -> dist\Setup.exe
+# 单文件安装器 -> dist\MonitorLux-Setup.exe
 powershell -ExecutionPolicy Bypass -File .\build\build-setup.ps1
 
 # 重新生成 assets\app.ico 与 docs\icon.png

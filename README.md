@@ -46,7 +46,7 @@ Monitor=[ViewSonic VX2780-2K-Pro] Ok=True cur=50 max=100
 
 **Option A — installer (recommended)**
 
-Download `Setup.exe` from [Releases](../../releases), run it. It installs to `%LOCALAPPDATA%\Programs\MonitorLux`, creates Start-menu and desktop shortcuts, enables autostart, and launches. Uninstall from **Settings → Apps**.
+Download `MonitorLux-Setup.exe` from [Releases](../../releases), run it. It installs to `%LOCALAPPDATA%\Programs\MonitorLux`, creates Start-menu and desktop shortcuts, enables autostart, and launches. Uninstall from **Settings → Apps**.
 
 **Option B — portable**
 
@@ -99,7 +99,7 @@ cd MonitorLux
 # app -> dist\MonitorLux.exe
 powershell -ExecutionPolicy Bypass -File .\build\build.ps1
 
-# single-file installer -> dist\Setup.exe
+# single-file installer -> dist\MonitorLux-Setup.exe
 powershell -ExecutionPolicy Bypass -File .\build\build-setup.ps1
 
 # regenerate assets\app.ico + docs\icon.png
