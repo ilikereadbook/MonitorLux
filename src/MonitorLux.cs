@@ -390,6 +390,10 @@ namespace MonitorLux
             return l.ToArray();
         }
 
+        // rc == 0 from SetDisplayConfig is not proof that anything changed: when the
+        // DP link is mid-handshake Windows accepts the topology and keeps the old one,
+        // and it returns ERROR_GEN_FAILURE (31) while the monitor is still asleep.
+        // so verify the result and give the link a few hundred ms to come up.
         public static bool Apply(Mode m)
         {
             uint topo;
@@ -399,13 +403,44 @@ namespace MonitorLux
                 case Mode.External: topo = SDC_TOPOLOGY_EXTERNAL; break;
                 case Mode.Extend:   topo = SDC_TOPOLOGY_EXTEND; break;
                 case Mode.Clone:    topo = SDC_TOPOLOGY_CLONE; break;
-                default: return false;
+                default: LastError = -1; return false;
             }
-            int rc;
-            try { rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, topo | SDC_APPLY); }
-            catch { rc = -1; }
-            LastError = rc;
-            return rc == 0;
+
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                int rc;
+                try { rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, topo | SDC_APPLY); }
+                catch { rc = -1; }
+                LastError = rc;
+
+                if (rc == 0)
+                {
+                    try { System.Threading.Thread.Sleep(150); } catch { }
+                    Mode now = Current;
+                    // only the single-panel modes have an unambiguous topology to compare
+                    if (m != Mode.Internal && m != Mode.External) return true;
+                    if (now == m) return true;
+                    LastError = -2;   // accepted, but the picture did not move
+                }
+
+                // a panel that was just powered down needs to retrain its link before
+                // it reappears on the bus - that is what ERROR_GEN_FAILURE means here
+                if (attempt < 3) { try { System.Threading.Thread.Sleep(500); } catch { } }
+            }
+            return false;
+        }
+
+        // turns the raw Win32 code into something a person can act on
+        public static string ErrorText(int code)
+        {
+            switch (code)
+            {
+                case 31: return "\u5916\u63A5\u663E\u793A\u5668\u672A\u5C31\u7EEA\uFF0C\u8BF7\u68C0\u67E5\u7EBF\u7F06";   // 外接显示器未就绪，请检查线缆
+                case 5:  return "\u7CFB\u7EDF\u62D2\u7EDD\u4E86\u8BE5\u64CD\u4F5C";                                       // 系统拒绝了该操作
+                case 87: return "\u663E\u793A\u914D\u7F6E\u65E0\u6548";                                                   // 显示配置无效
+                case -2: return "\u5DF2\u63A5\u53D7\u4F46\u753B\u9762\u672A\u5207\u6362";                                 // 已接受但画面未切换
+                default: return "\u9519\u8BEF\u7801 " + code;                                                              // 错误码 n
+            }
         }
 
         public static string Name(Mode m)
@@ -435,24 +470,101 @@ namespace MonitorLux
     }
 
     // one call does it: switch, rescan monitors, show feedback
+    // append-only trail in %LOCALAPPDATA%\MonitorLux\hotkey.log, so a keypress that
+    // "does nothing" can be told apart from a keypress that never arrived
+    public static class Diag
+    {
+        private static readonly object gate = new object();
+        private static string file;
+
+        public static string FilePath
+        {
+            get
+            {
+                if (file == null)
+                {
+                    try
+                    {
+                        string dir = Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                            "MonitorLux");
+                        Directory.CreateDirectory(dir);
+                        file = Path.Combine(dir, "hotkey.log");
+                    }
+                    catch { file = Path.Combine(Path.GetTempPath(), "MonitorLux-hotkey.log"); }
+                }
+                return file;
+            }
+        }
+
+        public static void Log(string s)
+        {
+            try
+            {
+                lock (gate)
+                {
+                    // BOM on the first write only, so a Windows console / Notepad can
+                    // tell the file is UTF-8 and the Chinese status lines stay readable
+                    bool fresh = !File.Exists(FilePath) || new FileInfo(FilePath).Length == 0;
+                    using (FileStream fs = new FileStream(FilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                    using (StreamWriter w = new StreamWriter(fs, new System.Text.UTF8Encoding(fresh)))
+                    {
+                        w.WriteLine(DateTime.Now.ToString("MM-dd HH:mm:ss.fff") + "  " + s);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void Reset()
+        {
+            try { lock (gate) { File.WriteAllText(FilePath, ""); } } catch { }
+        }
+    }
+
     public static class DisplayActions
     {
         public static void Go(DisplayTopology.Mode target)
         {
+            Diag.Log("Go(" + target + ") enter, current=" + DisplayTopology.Current);
+
+            // refuse up front when the panel we need is not on the bus - calling the
+            // API anyway just fails with 31 a few hundred ms later
+            bool needsExt = target == DisplayTopology.Mode.External || target == DisplayTopology.Mode.Extend;
+            bool needsInt = target == DisplayTopology.Mode.Internal || target == DisplayTopology.Mode.Extend;
+            if (needsExt && !DisplayTopology.HasExternalPanel)
+            {
+                Diag.Log("Go(" + target + ") aborted: no external panel");
+                try { Osd.ShowText("\u672A\u68C0\u6D4B\u5230\u5916\u63A5\u663E\u793A\u5668", 5); } catch { }   // 未检测到外接显示器
+                return;
+            }
+            if (needsInt && !DisplayTopology.HasInternalPanel)
+            {
+                Diag.Log("Go(" + target + ") aborted: no internal panel");
+                try { Osd.ShowText("\u672A\u68C0\u6D4B\u5230\u5185\u7F6E\u5C4F\u5E55", 5); } catch { }        // 未检测到内置屏幕
+                return;
+            }
+
             bool ok = DisplayTopology.Apply(target);
+            Diag.Log("Go(" + target + ") Apply=" + ok + " lastError=" + DisplayTopology.LastError);
+
             if (ok)
             {
                 // the topology is live as soon as the call returns, but DDC handles
                 // belong to the old configuration - give the OS a beat, then rescan
                 try { System.Threading.Thread.Sleep(260); } catch { }
                 DisplayTopology.Mode now = DisplayTopology.Current;
+                Diag.Log("Go(" + target + ") now=" + now);
                 if (now != DisplayTopology.Mode.Unknown) target = now;
                 try { Brightness.Reload(); } catch { }
-                Osd.ShowText(DisplayTopology.Name(target), DisplayTopology.Glyph(target));
+                try { Osd.ShowText(DisplayTopology.Name(target), DisplayTopology.Glyph(target)); }
+                catch (Exception ex) { Diag.Log("Osd.ShowText threw " + ex.GetType().Name + ": " + ex.Message); }
             }
             else
             {
-                Osd.ShowText("\u5207\u6362\u5931\u8D25 (" + DisplayTopology.LastError + ")", 5);   // 切换失败
+                string msg = DisplayTopology.ErrorText(DisplayTopology.LastError);
+                Diag.Log("Go(" + target + ") failed, lastError=" + DisplayTopology.LastError + " (" + msg + ")");
+                try { Osd.ShowText(msg, 5); } catch { }
             }
         }
     }
@@ -1140,6 +1252,7 @@ namespace MonitorLux
     public class HotkeyWindow : Form
     {
         private const int WM_HOTKEY = 0x0312;
+        private const int WM_DISPLAYCHANGE = 0x007E;
         private const uint MOD_ALT = 1;
         private const uint MOD_CONTROL = 2;
         private const uint MOD_SHIFT = 4;
@@ -1162,6 +1275,12 @@ namespace MonitorLux
         public static bool ExternalOk = false;
         public static bool ExtendOk = false;
         public static string BrightnessKeys = "";
+
+        // per-action labels for whatever actually got registered; empty means the
+        // combination was already owned by another app and the tray menu says so
+        public static string Key1 = "";
+        public static string Key2 = "";
+        public static string Key3 = "";
 
         public HotkeyWindow()
         {
@@ -1200,6 +1319,32 @@ namespace MonitorLux
             InternalOk = RegisterHotKey(Handle, 12, mods, VK_1);
             ExternalOk = RegisterHotKey(Handle, 13, mods, VK_2);
             ExtendOk = RegisterHotKey(Handle, 14, mods, VK_3);
+            if (InternalOk && ExternalOk && ExtendOk)
+            {
+                Key1 = "Ctrl+Alt+1"; Key2 = "Ctrl+Alt+2"; Key3 = "Ctrl+Alt+3";
+            }
+            else
+            {
+                // Ctrl+Alt+digit is a popular first choice for other software, and a
+                // losing registration is silent - so retry with Shift before giving up
+                if (InternalOk) { UnregisterHotKey(Handle, 12); InternalOk = false; }
+                if (ExternalOk) { UnregisterHotKey(Handle, 13); ExternalOk = false; }
+                if (ExtendOk) { UnregisterHotKey(Handle, 14); ExtendOk = false; }
+                uint m2 = mods | MOD_SHIFT;
+                InternalOk = RegisterHotKey(Handle, 12, m2, VK_1);
+                ExternalOk = RegisterHotKey(Handle, 13, m2, VK_2);
+                ExtendOk = RegisterHotKey(Handle, 14, m2, VK_3);
+                if (InternalOk && ExternalOk && ExtendOk)
+                {
+                    Key1 = "Ctrl+Shift+Alt+1"; Key2 = "Ctrl+Shift+Alt+2"; Key3 = "Ctrl+Shift+Alt+3";
+                }
+                else
+                {
+                    Key1 = InternalOk ? "Ctrl+Shift+Alt+1" : "";
+                    Key2 = ExternalOk ? "Ctrl+Shift+Alt+2" : "";
+                    Key3 = ExtendOk ? "Ctrl+Shift+Alt+3" : "";
+                }
+            }
         }
 
         protected override void WndProc(ref Message m)
@@ -1207,14 +1352,38 @@ namespace MonitorLux
             if (m.Msg == WM_HOTKEY)
             {
                 int id = m.WParam.ToInt32();
-                if (id == 10) Brightness.Adjust(STEP);
-                else if (id == 11) Brightness.Adjust(-STEP);
-                else if (id == 12) DisplayActions.Go(DisplayTopology.Mode.Internal);
-                else if (id == 13) DisplayActions.Go(DisplayTopology.Mode.External);
-                else if (id == 14) DisplayActions.Go(DisplayTopology.Mode.Extend);
+                Diag.Log("WM_HOTKEY id=" + id);
+                try
+                {
+                    if (id == 10) Brightness.Adjust(STEP);
+                    else if (id == 11) Brightness.Adjust(-STEP);
+                    else if (id == 12) DisplayActions.Go(DisplayTopology.Mode.Internal);
+                    else if (id == 13) DisplayActions.Go(DisplayTopology.Mode.External);
+                    else if (id == 14) DisplayActions.Go(DisplayTopology.Mode.Extend);
+                }
+                catch (Exception ex)
+                {
+                    Diag.Log("hotkey " + id + " threw " + ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+            else if (m.Msg == WM_DISPLAYCHANGE)
+            {
+                // a monitor came back from DP sleep or was plugged back in: the DDC
+                // handles from before the change are dead, so re-enumerate brightness
+                long now = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                if (now - lastDisplayChange > 400)
+                {
+                    lastDisplayChange = now;
+                    string topo;
+                    try { topo = DisplayTopology.Current.ToString(); } catch { topo = "?"; }
+                    Diag.Log("WM_DISPLAYCHANGE topology=" + topo);
+                    try { Brightness.Reload(); } catch { }
+                }
             }
             base.WndProc(ref m);
         }
+
+        private long lastDisplayChange = 0;
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -2276,9 +2445,12 @@ namespace MonitorLux
                 onlyExternal.Checked = now == DisplayTopology.Mode.External;
                 extendItem.Checked = now == DisplayTopology.Mode.Extend;
 
-                onlyInternal.ShortcutKeyDisplayString = HotkeyWindow.InternalOk ? "Ctrl+Alt+1" : "";
-                onlyExternal.ShortcutKeyDisplayString = HotkeyWindow.ExternalOk ? "Ctrl+Alt+2" : "";
-                extendItem.ShortcutKeyDisplayString = HotkeyWindow.ExtendOk ? "Ctrl+Alt+3" : "";
+                // show whichever combination actually got registered; if none did,
+                // say so instead of advertising a key that nothing is listening to
+                string busy = "\u70ED\u952E\u88AB\u5360\u7528";   // 热键被占用
+                onlyInternal.ShortcutKeyDisplayString = HotkeyWindow.InternalOk ? HotkeyWindow.Key1 : busy;
+                onlyExternal.ShortcutKeyDisplayString = HotkeyWindow.ExternalOk ? HotkeyWindow.Key2 : busy;
+                extendItem.ShortcutKeyDisplayString = HotkeyWindow.ExtendOk ? HotkeyWindow.Key3 : busy;
                 if (!hasExt) onlyExternal.Text = "\u4EC5\u5916\u63A5\u5C4F\u5E55 (\u672A\u68C0\u6D4B\u5230)";
                 else onlyExternal.Text = "\u4EC5\u5916\u63A5\u5C4F\u5E55";
             };
@@ -2335,8 +2507,17 @@ namespace MonitorLux
             {
                 hotkeys = new HotkeyWindow();
                 hotkeys.Show();
+                Diag.Log("start: pid=" + System.Diagnostics.Process.GetCurrentProcess().Id +
+                         " keys=[" + HotkeyWindow.BrightnessKeys + "] 1=" + HotkeyWindow.InternalOk +
+                         " 2=" + HotkeyWindow.ExternalOk + " 3=" + HotkeyWindow.ExtendOk +
+                         " topology=" + SafeTopology());
             }
-            catch { }
+            catch (Exception ex) { Diag.Log("start: hotkey init failed " + ex.GetType().Name + ": " + ex.Message); }
+        }
+
+        private static string SafeTopology()
+        {
+            try { return DisplayTopology.Current.ToString(); } catch { return "?"; }
         }
 
         private void TogglePopup()
@@ -2386,6 +2567,7 @@ namespace MonitorLux
             if (args.Length > 0 && args[0] == "--preview") { Preview(false); return; }
             if (args.Length > 0 && args[0] == "--preview-dark") { Theme.ForceDark = true; Preview(true); return; }
             if (args.Length > 0 && args[0] == "--traytest") { TrayTest(); return; }
+            if (args.Length > 0 && args[0] == "--hotkeytest") { HotkeyTest(); return; }
             if (args.Length > 0 && args[0] == "--osdtest") { OsdTest("20"); return; }
             if (args.Length > 1 && args[0] == "--osdtext") { OsdTest(args[1]); return; }
             if (args.Length > 0 && args[0] == "--menutest") { MenuTest(); return; }
@@ -2653,6 +2835,76 @@ namespace MonitorLux
                 lines.Add("EXCEPTION: " + ex.ToString());
             }
             File.WriteAllLines(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "_traytest.txt"), lines.ToArray());
+        }
+
+        // ------------------------------------------------------------------
+        // hotkey end-to-end probe: run the real tray context, inject Ctrl+Alt+1
+        // through keybd_event, then dump the log. tells "key never arrived"
+        // apart from "key arrived but the switch failed".
+        // ------------------------------------------------------------------
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        private static void SendCombo(byte vk)
+        {
+            const byte VK_CONTROL = 0x11;
+            const byte VK_MENU = 0x12;
+            const uint UP = 0x0002;
+            keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+            keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+            keybd_event(vk, 0, 0, UIntPtr.Zero);
+            System.Threading.Thread.Sleep(70);
+            keybd_event(vk, 0, UP, UIntPtr.Zero);
+            keybd_event(VK_MENU, 0, UP, UIntPtr.Zero);
+            keybd_event(VK_CONTROL, 0, UP, UIntPtr.Zero);
+        }
+
+        private static void HotkeyTest()
+        {
+            Diag.Reset();
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Theme.Update();
+            try { Brightness.Reload(); } catch { }
+
+            DisplayTopology.Mode before = DisplayTopology.Current;
+            TrayContext ctx = new TrayContext();
+
+            Diag.Log("=== probe: topology=" + before + " ===");
+            Diag.Log("registered: up=" + HotkeyWindow.UpOk + " down=" + HotkeyWindow.DownOk +
+                     " keys=[" + HotkeyWindow.BrightnessKeys + "]  1=" + HotkeyWindow.InternalOk +
+                     " 2=" + HotkeyWindow.ExternalOk + " 3=" + HotkeyWindow.ExtendOk);
+
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+            int phase = 0;
+            t.Interval = 1300;
+            t.Tick += delegate
+            {
+                if (phase == 0)
+                {
+                    phase = 1;
+                    Diag.Log("--- injecting Ctrl+Alt+1 (internal) ---");
+                    SendCombo(0x31);
+                    t.Interval = 2800;
+                }
+                else
+                {
+                    t.Stop();
+                    Diag.Log("=== after inject: topology=" + DisplayTopology.Current + " ===");
+                    DisplayTopology.Apply(DisplayTopology.Mode.External);
+                    Diag.Log("restored to " + DisplayTopology.Current);
+                    try
+                    {
+                        File.Copy(Diag.FilePath,
+                            Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "_hktest.txt"), true);
+                    }
+                    catch { }
+                    Application.Exit();
+                }
+            };
+            t.Start();
+            Application.Run(ctx);
+            try { ctx.Dispose(); } catch { }
         }
 
         public static void SelfTest()

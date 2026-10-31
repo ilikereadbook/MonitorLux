@@ -71,6 +71,8 @@ That's the whole setup. You never need to "open" it again.
 
 The display-mode items only light up for hardware that is actually present — plug the external monitor in and *Only external monitor* becomes available; unplug it and the item greys out.
 
+If `Ctrl + Alt + 1/2/3` is already taken by another app, all three move to `Ctrl + Shift + Alt + 1/2/3` together. The tray menu always prints the combination that is actually live, and says **hotkey taken** if none could be registered — a global hotkey that loses the race is otherwise silent.
+
 ![Full panel, light and dark](docs/panel-light.png)
 
 ## Command line
@@ -139,6 +141,7 @@ docs/      screenshots
 - KVM switches, HDMI splitters and some USB-C docks strip the DDC channel. Connect the monitor directly.
 - HDR mode can make the master brightness control behave inconsistently on some panels.
 - Only the *luminance* VCP code (0x10) is used — contrast, input source and other VCP features are not exposed yet.
+- Switching to *internal only* powers the DP link down. Getting the external monitor back takes a second or so of link retraining, and the monitor's own deep-sleep setting can stretch that.
 
 ## FAQ
 
@@ -150,6 +153,9 @@ Both hold global hooks and both write to the same VCP code. Pick one.
 
 **Nothing happens when I press the hotkeys.**
 `Ctrl+Alt+↑/↓` is owned by something else on a lot of machines — Intel graphics rotation, IMEs, GPU overlays. MonitorLux finds out at startup and re-registers the brightness pair as `Ctrl+Shift+Alt+↑/↓`. The tray menu always shows the combination that actually got registered, so check there rather than assuming.
+
+**"External monitor not ready" when switching back.**
+Switching to *internal only* takes the DP link down, and the monitor disappears from the display bus until it retrains — a few seconds. Asking for it back during that window fails with `ERROR_GEN_FAILURE` (31). MonitorLux now retries four times over roughly 1.5 s **and** verifies the topology actually changed, because `SetDisplayConfig` can return success while quietly leaving the old layout in place. If it still fails, the OSD says so plainly instead of showing a raw error code: wake the monitor, or replug the cable. A monitor that drops off the bus after waking is usually a deep-sleep setting in its own OSD menu.
 
 **Does switching display modes need admin rights?**
 No. `SetDisplayConfig` is a per-user operation, exactly like `Win+P`.
