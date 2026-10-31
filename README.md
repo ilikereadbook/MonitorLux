@@ -75,6 +75,19 @@ If `Ctrl + Alt + 1/2/3` is already taken by another app, all three move to `Ctrl
 
 ![Full panel, light and dark](docs/panel-light.png)
 
+## Two computers, one monitor
+
+A common setup: the monitor is shared, and the Windows machine has to *let go* of it before the Mac can take over.
+
+1. **Handing it over** — `Ctrl + Alt + 1` drops Windows to its internal panel. The DP output goes quiet, the monitor falls back to its other input, the Mac picks it up. Plug the Mac in before or after, either order works.
+2. **Taking it back** — unplug the Mac, then `Ctrl + Alt + 2`.
+
+Step 2 is the difficult one, and it is where most of this code's stubbornness comes from. The monitor is asleep, or still showing the other input, so it has to wake, switch input and retrain the DP link — seconds, not milliseconds. `SetDisplayConfig` keeps returning `ERROR_GEN_FAILURE` (31) for the whole time, which makes a naive switch look like *"the external monitor cannot be found"*. MonitorLux therefore:
+
+- retries for about four seconds before admitting defeat
+- keeps the switch **pending for 45 s**: the instant the monitor reappears on the display bus (`WM_DISPLAYCHANGE`), it completes by itself — so plugging the cable back in is enough, no second keypress needed
+- never refuses a switch merely because the monitor is not enumerable right now, since waking that link up is precisely what `SetDisplayConfig` does
+
 ## Command line
 
 Useful for scripts, shortcuts, or Stream Deck buttons. These work without the tray app running.

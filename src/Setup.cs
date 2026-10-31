@@ -19,7 +19,7 @@ namespace MonitorLuxSetup
         private static string L(string zh, string en) { return Zh ? zh : en; }
 
         public static void ForceEnglish() { Zh = false; }
-        private const string Version = "1.1.1";
+        private const string Version = "1.1.2";
         private const string PayloadName = "MonitorLux.exe";
 
         private float k = 1f;

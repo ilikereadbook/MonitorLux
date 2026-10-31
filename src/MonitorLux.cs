@@ -406,7 +406,7 @@ namespace MonitorLux
                 default: LastError = -1; return false;
             }
 
-            for (int attempt = 0; attempt < 4; attempt++)
+            for (int attempt = 0; attempt < 8; attempt++)
             {
                 int rc;
                 try { rc = SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, topo | SDC_APPLY); }
@@ -423,9 +423,10 @@ namespace MonitorLux
                     LastError = -2;   // accepted, but the picture did not move
                 }
 
-                // a panel that was just powered down needs to retrain its link before
-                // it reappears on the bus - that is what ERROR_GEN_FAILURE means here
-                if (attempt < 3) { try { System.Threading.Thread.Sleep(500); } catch { } }
+                // a panel that was just powered down - or is still showing the other
+                // machine's input - has to wake up, switch input and retrain its link
+                // before it is back. that takes seconds, not milliseconds.
+                if (attempt < 7) { try { System.Threading.Thread.Sleep(500); } catch { } }
             }
             return false;
         }
@@ -524,25 +525,41 @@ namespace MonitorLux
 
     public static class DisplayActions
     {
+        // a switch that failed because the panel was still waking is remembered here:
+        // the next WM_DISPLAYCHANGE finishes the job without another keypress
+        public static DisplayTopology.Mode Pending = DisplayTopology.Mode.Unknown;
+        private static long pendingAt = 0;
+
+        private static bool busy = false;
+
         public static void Go(DisplayTopology.Mode target)
         {
-            Diag.Log("Go(" + target + ") enter, current=" + DisplayTopology.Current);
+            if (busy) { Diag.Log("Go(" + target + ") skipped, another switch is running"); return; }
+            busy = true;
+            try { GoCore(target); }
+            finally { busy = false; }
+        }
 
-            // refuse up front when the panel we need is not on the bus - calling the
-            // API anyway just fails with 31 a few hundred ms later
+        private static long Now() { return DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond; }
+
+        private static void GoCore(DisplayTopology.Mode target)
+        {
+            Pending = DisplayTopology.Mode.Unknown;
+            Diag.Log("Go(" + target + ") enter, current=" + DisplayTopology.Current +
+                     " hasInt=" + DisplayTopology.HasInternalPanel +
+                     " hasExt=" + DisplayTopology.HasExternalPanel);
+
             bool needsExt = target == DisplayTopology.Mode.External || target == DisplayTopology.Mode.Extend;
-            bool needsInt = target == DisplayTopology.Mode.Internal || target == DisplayTopology.Mode.Extend;
-            if (needsExt && !DisplayTopology.HasExternalPanel)
+
+            // A monitor that is asleep - or still showing the other machine's input -
+            // may not be enumerable at all. Do NOT refuse here: SetDisplayConfig is
+            // also the thing that wakes the DP link back up, so always try.
+            bool extNotSeen = needsExt && !DisplayTopology.HasExternalPanel;
+            if (extNotSeen)
             {
-                Diag.Log("Go(" + target + ") aborted: no external panel");
-                try { Osd.ShowText("\u672A\u68C0\u6D4B\u5230\u5916\u63A5\u663E\u793A\u5668", 5); } catch { }   // 未检测到外接显示器
-                return;
-            }
-            if (needsInt && !DisplayTopology.HasInternalPanel)
-            {
-                Diag.Log("Go(" + target + ") aborted: no internal panel");
-                try { Osd.ShowText("\u672A\u68C0\u6D4B\u5230\u5185\u7F6E\u5C4F\u5E55", 5); } catch { }        // 未检测到内置屏幕
-                return;
+                Diag.Log("external panel not enumerated, trying anyway");
+                // say something before the retry loop, which can take several seconds
+                try { Osd.ShowText("\u7B49\u5F85\u5916\u63A5\u663E\u793A\u5668", 5); } catch { }   // 等待外接显示器
             }
 
             bool ok = DisplayTopology.Apply(target);
@@ -562,10 +579,36 @@ namespace MonitorLux
             }
             else
             {
-                string msg = DisplayTopology.ErrorText(DisplayTopology.LastError);
-                Diag.Log("Go(" + target + ") failed, lastError=" + DisplayTopology.LastError + " (" + msg + ")");
-                try { Osd.ShowText(msg, 5); } catch { }
+                Diag.Log("Go(" + target + ") failed, lastError=" + DisplayTopology.LastError);
+
+                // arm a one-shot retry: the monitor is on its way back, and when the
+                // display change lands we finish the switch by ourselves
+                Pending = target;
+                pendingAt = Now();
+
+                if (!extNotSeen)
+                {
+                    string msg = DisplayTopology.ErrorText(DisplayTopology.LastError);
+                    try { Osd.ShowText(msg, 5); } catch { }
+                }
             }
+        }
+
+        // called from the display-change message; completes a switch that gave up
+        // while the link was still coming up
+        public static void OnDisplayChanged()
+        {
+            if (Pending == DisplayTopology.Mode.Unknown) return;
+            if (Now() - pendingAt > 45000)
+            {
+                Diag.Log("pending " + Pending + " expired");
+                Pending = DisplayTopology.Mode.Unknown;
+                return;
+            }
+            DisplayTopology.Mode want = Pending;
+            Pending = DisplayTopology.Mode.Unknown;
+            Diag.Log("auto-retry " + want + " after display change");
+            Go(want);
         }
     }
 
@@ -1368,6 +1411,10 @@ namespace MonitorLux
             }
             else if (m.Msg == WM_DISPLAYCHANGE)
             {
+                // a pending switch wants the very first notification, so this runs
+                // outside the debounce below
+                try { DisplayActions.OnDisplayChanged(); } catch { }
+
                 // a monitor came back from DP sleep or was plugged back in: the DDC
                 // handles from before the change are dead, so re-enumerate brightness
                 long now = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
@@ -2567,7 +2614,7 @@ namespace MonitorLux
             if (args.Length > 0 && args[0] == "--preview") { Preview(false); return; }
             if (args.Length > 0 && args[0] == "--preview-dark") { Theme.ForceDark = true; Preview(true); return; }
             if (args.Length > 0 && args[0] == "--traytest") { TrayTest(); return; }
-            if (args.Length > 0 && args[0] == "--hotkeytest") { HotkeyTest(); return; }
+            if (args.Length > 0 && args[0] == "--hotkeytest") { HotkeyTest(args.Length > 1 && args[1] == "seq"); return; }
             if (args.Length > 0 && args[0] == "--osdtest") { OsdTest("20"); return; }
             if (args.Length > 1 && args[0] == "--osdtext") { OsdTest(args[1]); return; }
             if (args.Length > 0 && args[0] == "--menutest") { MenuTest(); return; }
@@ -2861,6 +2908,13 @@ namespace MonitorLux
 
         private static void HotkeyTest()
         {
+            HotkeyTest(false);
+        }
+
+        // seq mode reproduces the two-machine workflow: drop the DP link, then ask
+        // for it back a moment later while the monitor is still waking up
+        private static void HotkeyTest(bool seq)
+        {
             Diag.Reset();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -2870,7 +2924,7 @@ namespace MonitorLux
             DisplayTopology.Mode before = DisplayTopology.Current;
             TrayContext ctx = new TrayContext();
 
-            Diag.Log("=== probe: topology=" + before + " ===");
+            Diag.Log("=== probe: topology=" + before + " mode=" + (seq ? "seq" : "single") + " ===");
             Diag.Log("registered: up=" + HotkeyWindow.UpOk + " down=" + HotkeyWindow.DownOk +
                      " keys=[" + HotkeyWindow.BrightnessKeys + "]  1=" + HotkeyWindow.InternalOk +
                      " 2=" + HotkeyWindow.ExternalOk + " 3=" + HotkeyWindow.ExtendOk);
@@ -2885,12 +2939,21 @@ namespace MonitorLux
                     phase = 1;
                     Diag.Log("--- injecting Ctrl+Alt+1 (internal) ---");
                     SendCombo(0x31);
-                    t.Interval = 2800;
+                    t.Interval = seq ? 1500 : 2800;
+                }
+                else if (phase == 1 && seq)
+                {
+                    phase = 2;
+                    Diag.Log("--- injecting Ctrl+Alt+2 (external) right away, topology=" +
+                             DisplayTopology.Current + " hasExt=" + DisplayTopology.HasExternalPanel + " ---");
+                    SendCombo(0x32);
+                    t.Interval = 9000;   // long enough for 8 retries plus a pending retry
                 }
                 else
                 {
                     t.Stop();
-                    Diag.Log("=== after inject: topology=" + DisplayTopology.Current + " ===");
+                    Diag.Log("=== after probe: topology=" + DisplayTopology.Current +
+                             " pending=" + DisplayActions.Pending + " ===");
                     DisplayTopology.Apply(DisplayTopology.Mode.External);
                     Diag.Log("restored to " + DisplayTopology.Current);
                     try
